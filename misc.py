@@ -1,9 +1,11 @@
+import sys
+sys.path.append('utils/lib')
 import numpy as np
 import pandas as pd
 import scipy as scipy
 import cPickle as pickle
 from collections import Counter
-import gzip, time, math, datetime, random, os, gc
+import gzip, time, math, datetime, random, os, gc, logging
 from sklearn import preprocessing, grid_search, utils, metrics, cross_validation
 from scipy.stats import sem 
 from scipy.stats.mstats import mode
@@ -12,19 +14,40 @@ from sklearn.externals import joblib
 cfg = {
   'sys_seed':0,
   'debug':True,
-  'scoring': None
+  'scoring': None,
+  'indent': 0
 }
 
 random.seed(cfg['sys_seed'])
 np.random.seed(cfg['sys_seed']) 
 NA = 99999.0
+logging.basicConfig(level=logging.DEBUG, 
+    format='%(asctime)s %(levelname)s %(message)s')
+log = logging.getLogger(__name__)
+t0 = time.time()
+
+def debug(msg): 
+  if not cfg['debug']: return
+  log.info(msg)
+
+def start(msg): 
+  if not cfg['debug']: return
+  global t0
+  t0 = time.time()
+  log.info(msg)
+
+def stop(msg): 
+  if not cfg['debug']: return
+  global t0
+  log.info(msg + (', took (h:m:s): %s' % 
+    datetime.timedelta(seconds=time.time() - t0)))
+  t0 = time.time()
 
 def reseed(clf):
   clf.random_state = cfg['sys_seed']
   random.seed(cfg['sys_seed'])
   np.random.seed(cfg['sys_seed']) 
   return clf
-
 
 def model_name(clf):
   name = type(clf).__name__
@@ -46,7 +69,7 @@ def get_col_aggregate(col, mode):
   raise Exception('Unsupported aggregate mode: ' + `mode`)
 
 def mean_score(scores):
-  return ("{0:.3f} (+/-{1:.3f})").format(np.mean(scores), sem(scores))
+  return ("{0:.5f} (+/-{1:.5f})").format(np.mean(scores), sem(scores))
 
 def scale(X, min_max=None):  
   pp = preprocessing
@@ -90,16 +113,24 @@ def do_n_sample_search(clf, X, y, n_samples_arr):
   return (scores, sems)
 
 
-def do_cv(clf, X, y, n_samples=1000, n_iter=3, test_size=0.1, quiet=False, scoring=None, stratified=False, fit_params=None, reseed_classifier=True):
+def do_cv(clf, X, y, n_samples=None, n_iter=3, test_size=0.1, quiet=False, scoring=None, stratified=False, fit_params=None, reseed_classifier=True, n_jobs=-1):
   t0 = time.time()
   if reseed_classifier: reseed(clf)
+  
+  if n_samples is None: n_samples = len(y)
+  elif type(n_samples) is float: n_samples = int(n_samples)
+  
   try:
     if (n_samples > X.shape[0]): n_samples = X.shape[0]
   except: pass
   cv = cross_validation.ShuffleSplit(n_samples, n_iter=n_iter, test_size=test_size, random_state=cfg['sys_seed']) \
     if not(stratified) else cross_validation.StratifiedShuffleSplit(y, n_iter, train_size=n_samples, test_size=test_size, random_state=cfg['sys_seed'])
 
-  test_scores = cross_validation.cross_val_score(clf, X, y, cv=cv, scoring=scoring or cfg['scoring'], fit_params=fit_params)
+  if n_jobs == -1 and cfg['cv_n_jobs'] > 0: n_jobs = cfg['cv_n_jobs']
+
+  test_scores = cross_validation.cross_val_score(
+      clf, X, y, cv=cv, scoring=scoring or cfg['scoring'], 
+      fit_params=fit_params, n_jobs=n_jobs)
   if not(quiet): 
     dbg('%s took: %.2fm' % (mean_score(test_scores), (time.time() - t0)/60))
   return (np.mean(test_scores), sem(test_scores))
@@ -150,25 +181,45 @@ def show_score(y_true, y_pred):
   dbg('Accuracy: ', accuracy, '\n\nMatrix:\n', matrix, '\n\nReport\n', report)
   return accuracy
 
-def do_gs(clf, X, y, params, n_samples=1000, cv=3, n_jobs=-1, scoring=None, fit_params=None):
+def do_gs(clf, X, y, params, n_samples=1000, n_iter=3, 
+    n_jobs=-2, scoring=None, fit_params=None, 
+    random_iterations=None):
+  start('starting grid search')
+  if type(n_samples) is float: n_samples = int(n_samples)
   reseed(clf)
-  gs = grid_search.GridSearchCV(clf, params, cv=cv, n_jobs=n_jobs, verbose=2, scoring=scoring or cfg['scoring'], fit_params=fit_params)
+  cv = cross_validation.ShuffleSplit(n_samples, n_iter=n_iter, random_state=cfg['sys_seed'])
+  if random_iterations is None:
+    gs = grid_search.GridSearchCV(clf, params, cv=cv, 
+      n_jobs=n_jobs, verbose=2, scoring=scoring or cfg['scoring'], fit_params=fit_params)
+  else:
+    gs = grid_search.RandomizedSearchCV(clf, params, random_iterations, cv=cv, 
+      n_jobs=n_jobs, verbose=2, scoring=scoring or cfg['scoring'], 
+      fit_params=fit_params, refit=False)
   X2, y2 = utils.shuffle(X, y, random_state=cfg['sys_seed'])  
   gs.fit(X2[:n_samples], y2[:n_samples])
-  dbg(gs.best_params_, gs.best_score_)
+  stop('done grid search')
+  dbg(gs.best_params_, gs.best_score_)  
   return gs
 
-def dump(file, data):
+def dump(file, data):  
   if not os.path.isdir('data/pickles'): os.makedirs('data/pickles')
-  joblib.dump(data, 'data/pickles/' + file);
+  if not '.' in file: file += '.pickle'
+  joblib.dump(data, 'data/pickles/' + file);  
 
-def load(file):
-  file = 'data/pickles/' + file
-  if not os.path.isfile(file): return None
-  return joblib.load(file);
+def load(file, opt_fallback=None):
+  full_file = 'data/pickles/' + file
+  if not '.' in full_file: full_file += '.pickle'
+  if os.path.isfile(full_file): return joblib.load(full_file);
+  if opt_fallback is None: return None
+  data = opt_fallback()
+  dump(file, data)
+  return data
+  
+def get_write_file_stream(file):
+  return gzip.GzipFile(file, 'wb') if file.endswith('.gz') else open(file, "wb")
 
 def save_data(file, data):
-  if (file.endswith('z')):
+  if (file.endswith('.gz')):
     f = gzip.GzipFile(file, 'wb')
     f.write(pickle.dumps(data, 0))
     f.close()
@@ -194,11 +245,23 @@ def read_data(file):
     f.close()
     return data
 
-def to_csv_gz(data_dict, file):
-  compress = file.endswith('.gz')
-  in_name = file + '.uncompressed' if compress else file
-  pd.DataFrame(data_dict).to_csv(in_name, index=False)  
-  if compress: gzip_file(in_name, file)
+def read_df(file, nrows=None):
+  if file.endswith('.pickle'): return load(file)
+  
+  compression = 'gzip' if file.endswith('.gz') else None
+  nrows = None if nrows == None else int(nrows)
+  return pd.read_csv(file, compression=compression, nrows=nrows);
+
+def read_lines(file, ignore_header=False):
+  with open(file) as f:
+    if ignore_header: f.readline()
+    return f.readlines()
+
+def to_csv_gz(data_dict, file, columns=None):
+  if file.endswith('.gz'): file = gzip.open(file, "wb")
+  df = data_dict
+  if type(df) is not pd.DataFrame: df = pd.DataFrame(df)
+  df.to_csv(file, index=False, columns=columns)  
 
 def gzip_file(in_name, out_name):  
   f_in = open(in_name, 'rb')

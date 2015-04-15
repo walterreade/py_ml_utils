@@ -21,30 +21,8 @@ from sklearn.preprocessing import OneHotEncoder
 from sklearn.decomposition import PCA
 from sklearn import utils, cross_validation
 from scipy import sparse
-import itertools, logging, time, datetime, random
+import itertools, random, gzip
 from scipy.ndimage.filters import *
-
-logging.basicConfig(level=logging.DEBUG, 
-    format='%(asctime)s %(levelname)s %(message)s')
-log = logging.getLogger(__name__)
-t0 = time.time()
-
-def debug(msg): 
-  if not cfg['debug']: return
-  log.info(msg)
-
-def start(msg): 
-  if not cfg['debug']: return
-  global t0
-  t0 = time.time()
-  log.info(msg)
-
-def stop(msg): 
-  if not cfg['debug']: return
-  global t0
-  log.info(msg + (', took (h:m:s): %s' % 
-    datetime.timedelta(seconds=time.time() - t0)))
-  t0 = time.time()
 
 '''
 Series Extensions
@@ -66,6 +44,14 @@ def _s_sigma_limits(self, sigma):
   delta = float(sigma) * self.std()
   m = self.mean()
   return (m - delta, m + delta)
+
+def _s_to_indexes(self):
+  c = self.name
+  col = 'i_' + c
+  cat = pd.Categorical.from_array(self)
+  lbls = cat.codes if hasattr(cat, 'codes') else cat.labels    
+  return pd.Series(lbls, index=self.index, \
+      dtype=_get_optimal_numeric_type('int', 0, len(lbls) + 1))
 
 '''
 DataFrame Extensions
@@ -108,9 +94,9 @@ def _df_one_hot_encode(self, dtype=np.float):
   
   matrix = ohe_sparse if not others else sparse.hstack((ohe_sparse, others_df))
   stop('done one_hot_encoding')
-  return matrix
+  return matrix.tocsr()
 
-def _df_to_indexes(self, drop_origianls=False):
+def _df_to_indexes(self, drop_origianls=False, sparsify=False):
   start('indexing categoricals in data frame. Note: NA gets turned into max index (255, 65535, etc)')  
   for c in self.categoricals():
     col = 'i_' + c
@@ -121,7 +107,7 @@ def _df_to_indexes(self, drop_origianls=False):
     modes = s.mode()
     mode = lbls[0]
     if len(modes) > 0: mode = modes.iget(0)
-    self[col] = s.to_sparse(fill_value=int(mode))            
+    self[col] = s.to_sparse(fill_value=int(mode)) if sparsify else s
     if drop_origianls: self.drop(c, 1, inplace=True)
   stop('done indexing categoricals in data frame')  
   return self
@@ -166,7 +152,7 @@ def _df_remove(self, columns=[], categoricals=False, numericals=False,
     raise Exception('At least one of categoricals, numericals, ' +
       'dates binaries should be set to True or columns array passed')
 
-  debug('removing from data frame: ' + `cols`)
+  debug('removing ' + `len(cols)` + ' columns from data frame')
   self.drop(cols, 1, inplace=True)
   return self
 
@@ -205,9 +191,9 @@ def _df_engineer(self, name, columns=None, quiet=False):
       self.engineer(func_to_string(a))
 
   if not quiet: debug('engineering feature: ' + name)
-  if len(args) == 0 and (func == 'mult' or func == 'concat'):    
+  if len(args) == 0 and (func == 'avg' or func == 'mult' or func == 'concat'):    
     combs = list(itertools.combinations(columns, 2)) if columns \
-      else self.combinations(categoricals=func=='concat', indexes=func=='concat', numericals=func=='mult')    
+      else self.combinations(categoricals=func=='concat', indexes=func=='concat', numericals=func=='mult' or func=='avg')    
     for c1, c2 in combs: self.engineer(func + '(' + c1 + ',' + c2 + ')', quiet=True)
     return self
   elif func == 'concat': 
@@ -222,6 +208,12 @@ def _df_engineer(self, name, columns=None, quiet=False):
       self[new_name] = self[args[0]] * self[args[1]]
     if len(args) == 3: 
       self[new_name] = self[args[0]] * self[args[1]] * self[args[2]]
+  elif func  == 'avg':     
+    if len(args) < 2 or len(args) > 3: raise Exception(name + ' only supports 2 or 3 columns')
+    if len(args) == 2: 
+      self[new_name] = (self[args[0]] + self[args[1]]) / 2
+    if len(args) == 3: 
+      self[new_name] = (self[args[0]] + self[args[1]] + self[args[2]]) / 3
   elif len(args) == 1 and func == 'pow':
     cols = columns if columns else self.numericals()
     for n in cols: self.engineer('pow(' + n + ', ' + args[0] + ')', quiet=True)
@@ -230,10 +222,16 @@ def _df_engineer(self, name, columns=None, quiet=False):
     cols = columns if columns else self.numericals()
     for n in cols: self.engineer('lg(' + n + ')', quiet=True)    
     return self
+  elif len(args) == 0 and func == 'sqrt':
+    cols = columns if columns else self.numericals()
+    for n in cols: self.engineer('sqrt(' + n + ')', quiet=True)    
+    return self
   elif func == 'pow': 
     self[new_name] = np.power(self[args[0]], int(args[1]))
   elif func == 'lg': 
     self[new_name] = np.log(self[args[0]])
+  elif func == 'sqrt': 
+    self[new_name] = np.sqrt(self[args[0]])
   elif func.startswith('rolling_'):
     if len(args) == 1:
       cols = columns if columns else self.numericals()
@@ -318,6 +316,7 @@ def _get_col_aggregate(col, mode):
   if mode == 'median': return col.median()
   if mode == 'min': return col.min()
   if mode == 'max': return col.max()
+  if mode == 'max+1': return col.max()+1
   return mode
 
 def _df_outliers(self, stds=3):  
@@ -336,10 +335,12 @@ def _s_categorical_outliers(self, min_size=0.01, fill_mode='mode'):
   fill = _get_col_aggregate(col, fill_mode)
   vc = col.value_counts()
   under = vc[vc <= threshold]    
-  if under.shape[0] > 0: col[col.isin(under.index)] = fill
+  if under.shape[0] > 0: 
+    debug('column [' + col.name + '] threshold[' + `threshold` + '] fill[' + `fill` + '] num of rows[' + `len(under.index)` + ']')
+    col[col.isin(under.index)] = fill
   return col
 
-def _s_compress(self, aggresiveness=0):  
+def _s_compress(self, aggresiveness=0, sparsify=False):  
   def _get_optimal_numeric_type(dtype, min, max):
     dtype = str(dtype)
     is_int = dtype.startswith('int')
@@ -385,19 +386,20 @@ def _s_compress(self, aggresiveness=0):
   prefix = self.name[0:2]
   if prefix == 'n_' or prefix == 'i_':  
     if prefix == 'i_' or str(self.dtype).startswith('int'):        
-      return self.astype(_get_optimal_numeric_type('int', min(self), max(self))).\
-        to_sparse(fill_value=int(self.mode()))    
+      compressed = self.astype(_get_optimal_numeric_type('int', min(self), max(self)))
+      return compressed if not sparsify else compressed.to_sparse(fill_value=int(self.mode()))    
     elif str(self.dtype).startswith('float'):
       return self.astype(_get_optimal_numeric_type(self.dtype, min(self), max(self)))
     else:
       raise Exception(self.name + ' expected "int" or "float" type got: ', str(self.dtype))
-  else : raise Exception(self.name + ' is not supported')
+  else : 
+    print self.name + ' is not supported, ignored during compression'
   return self
 
 def _df_categorical_outliers(self, min_size=0.01, fill_mode='mode'):      
   start('binning categorical outliers, min_size: ' + `min_size`)
 
-  for c in self.categoricals():     
+  for c in self.categoricals() + self.indexes():     
     self[c] = self[c].categorical_outliers(min_size, fill_mode)
 
   stop('done binning categorical outliers')
@@ -432,15 +434,7 @@ def _df_append_right(self, df_or_s):
 
 def _df_append_bottom(self, df):  
   debug('warning: DataFrame.append_bottom always returns a new DataFrame')
-  new_df = pd.DataFrame(columns=self.columns)
-  for c in self.columns:
-    values1 = self[c].to_dense().values if _is_sparse(self[c]) else self[c].values
-    values2 = df[c].to_dense().values if _is_sparse(df[c]) else df[c].values
-    data = np.append(values1, values2)
-    new_df[c] = pd.Series(data, dtype=self[c].dtype)
-    if _is_sparse(self[c]):
-      new_df[c] = new_df[c].to_sparse(fill_value=self[c].fill_value)
-  return new_df
+  return pd.concat([self, df], ignore_index=True)
 
 def _create_df_from_templage(template, data, index=None):
   df = pd.DataFrame(columns=template.columns, data=data, index=index)
@@ -453,6 +447,19 @@ def _create_s_from_templage(template, data):
   s = pd.Series(data)
   if template.dtype != s.dtype: s = s.astype(template.dtype)
   return s
+
+def _df_subsample(self, y=None, size=0.5):  
+  if type(size) is float:
+    if size < 1.0: size = df.shape[0] * size
+    size = int(size)
+  if self.shape[0] <= size: return self if y is None else (self, y) # unchanged    
+
+  start('subsample data frame')
+  df = self.copy().shuffle(y)
+  
+  result = df[:size] if y is None else df[0][:size], df[1][:size]  
+  start('done, subsample data frame')
+  return result
 
 def _df_shuffle(self, y=None):  
   start('shuffling data frame')
@@ -489,35 +496,39 @@ def _df_noise_filter(self, type, *args, **kargs):
   filtered = filter(self.values, *args, **kargs)
   return  _create_df_from_templage(self, filtered, self.index)
 
-def _df_split(self, y, train_ratio=0.5):
-  train_size = int(self.shape[0] * 0.5)
-  test_size = int(self.shape[0] * (1-0.5))
-  X_train, X_test, y_train, y_test = cross_validation.train_test_split(self, y, 
-    train_size=train_size, test_size=test_size, random_state=cfg['sys_seed'])
-
-  return (
-    _create_df_from_templage(self, X_train), 
-    _create_s_from_templage(y, y_train),
-    _create_df_from_templage(self, X_test),
-    _create_s_from_templage(y, y_test)
+def _df_split(self, y, stratified=False, train_fraction=0.5):  
+  train_size = int(self.shape[0] * train_fraction)
+  test_size = int(self.shape[0] * (1.0-train_fraction))  
+  start('splitting train_size: ' + `train_size` + ' test_size: ' + `test_size`)
+  splitter = cross_validation.StratifiedShuffleSplit if stratified else \
+    cross_validation.ShuffleSplit
+  train_indexes, test_indexes = list(splitter(y, 1, test_size, train_size))[0]
+  new_set = (
+    self.iloc[train_indexes], 
+    y.iloc[train_indexes], 
+    self.iloc[test_indexes], 
+    y.iloc[test_indexes]
   )
+  stop('splitting done')
+  return new_set
 
-def _df_cv(self, clf, y, n_samples=25000, n_iter=3, scoring=None):  
-  return _df_cv_impl_(self, clf, y, n_samples, n_iter, scoring)
+def _df_cv(self, clf, y, n_samples=None, n_iter=3, scoring=None, n_jobs=-1):  
+  return _df_cv_impl_(self, clf, y, n_samples, n_iter, scoring, n_jobs)
 
-def _df_cv_ohe(self, clf, y, n_samples=25000, n_iter=3, scoring=None):  
-  return _df_cv_impl_(self.one_hot_encode(), clf, y, n_samples, n_iter, scoring)
+def _df_cv_ohe(self, clf, y, n_samples=None, n_iter=3, scoring=None, n_jobs=-1):  
+  return _df_cv_impl_(self.one_hot_encode(), clf, y, n_samples, n_iter, scoring, n_jobs)
 
-def _df_cv_impl_(X, clf, y, n_samples=25000, n_iter=3, scoring=None):  
+def _df_cv_impl_(X, clf, y, n_samples=None, n_iter=3, scoring=None, n_jobs=-1):  
   if hasattr(y, 'values'): y = y.values
-  n_samples = min(n_samples, len(y), X.shape[0])
+  if n_samples is None: n_samples = len(y)
+  else: n_samples = min(n_samples, len(y), X.shape[0])
   if len(y) < X.shape[0]: X = X[:len(y)]
   if utils.multiclass.type_of_target(y) == 'binary' and not (scoring or cfg['scoring']): 
     scoring = 'roc_auc'
   start('starting ' + `n_iter` + ' fold cross validation (' + 
       `n_samples` + ' samples) w/ metric: ' + `scoring or cfg['scoring']`)
-  cv = do_cv(clf, X, y, n_samples, n_iter=n_iter, scoring=scoring, quiet=True)
-  stop('done cross validation:\n  [CV]: ' + ("{0:.3f} (+/-{1:.3f})").format(cv[0], cv[1]))  
+  cv = do_cv(clf, X, y, n_samples, n_iter=n_iter, scoring=scoring, quiet=True, n_jobs=n_jobs)
+  stop('done cross validation:\n  [CV]: ' + ("{0:.5f} (+/-{1:.5f})").format(cv[0], cv[1]))  
   return cv
 
 def _df_pca(self, n_components, whiten=False):  
@@ -533,6 +544,53 @@ def _df_predict(self, clf, y, X_test=None):
     X_train = self[:len(y)]
   return clf.fit(X_train, y).predict(X_test)
 
+def _df_predict_proba(self, clf, y, X_test=None):    
+  reseed(clf)
+  X_train = self
+  if X_test is None and self.shape[0] > len(y):
+    X_test = self[len(y):]
+    X_train = self[:len(y)]
+  return clf.fit(X_train, y).predict_proba(X_test)
+
+def _df_self_predict(self, clf, y, n_chunks=5):    
+  return __df_self_predict_impl(self, clf, y, n_chunks, False)
+
+def _df_self_predict_proba(self, clf, y, n_chunks=5):    
+  return __df_self_predict_impl(self, clf, y, n_chunks, True)
+
+def __df_self_predict_impl(X, clf, y, n_chunks, predict_proba):    
+  if y is not None and X.shape[0] != len(y): 
+    raise Exception('self_predict should have enough y values to do full prediction.')
+  start('self_predict with ' + `n_chunks` + ' starting')
+  reseed(clf)
+  chunk_size = int(math.ceil(X.shape[0] / float(n_chunks)))
+  predictions = []
+  iteration = 0
+  while True:
+    begin = iteration * chunk_size
+    iteration += 1
+    if begin >= X.shape[0]: break
+    end = begin + chunk_size
+    X_train = X[:begin].append_bottom(X[end:])
+    X_test = X[begin:end]
+    y2 = None if y is None else pd.concat((y[:begin], y[end:]), 0, ignore_index=True)    
+
+    clf.fit(X_train, y2)    
+    new_predictions = clf.predict_proba(X_test) if predict_proba else clf.predict(X_test)    
+    if len(new_predictions.shape) > 1 and new_predictions.shape[1] == 1:
+      new_predictions = new_predictions.T[1]
+    if new_predictions.shape[0] == 1:      
+      new_predictions = new_predictions.reshape(-1, 1)
+    if iteration == 1:
+      predictions = new_predictions
+    elif predict_proba:
+      predictions = np.vstack((predictions, new_predictions))
+    else:
+      predictions = np.hstack((predictions, new_predictions))
+  stop('self_predict completed')
+  return predictions
+
+
 def _df_trim_on_y(self, y, sigma_or_min_y, max_y=None):    
   X = self.copy()  
   X['__tmpy'] = y.copy()
@@ -544,11 +602,12 @@ def _df_trim_on_y(self, y, sigma_or_min_y, max_y=None):
   y = X['__tmpy']
   return (X.drop(['__tmpy'], 1), y)
 
-def _df_save_csv(self, file):    
-  compress = file.endswith('.gz')
-  in_name = file + '.uncompressed' if compress else file
-  self.to_csv(in_name, index=False)  
-  if compress: gzip_file(in_name, file)
+def _df_save_csv(self, file):   
+  if file.endswith('.pickle'): 
+    dump(file, self)
+    return self
+  if file.endswith('.gz'): file = gzip.open(file, "wb")
+  self.to_csv(file, index=False)  
   return self
 
 def _df_nbytes(self):    
@@ -598,7 +657,7 @@ def _get_optimal_numeric_type(dtype, min, max, aggresiveness=0):
       else: raise Exception('Unsupported type: ' + dtype)
     if aggresiveness == 2: return 'float16'  
 
-def _df_compress(self, aggresiveness=0, to_sparse=False):  
+def _df_compress(self, aggresiveness=0, sparsify=False):  
   start('compressing dataset with ' + `len(self.columns)` + ' columns')    
 
   def _format_bytes(num):
@@ -613,7 +672,7 @@ def _df_compress(self, aggresiveness=0, to_sparse=False):
   self.columns = map(lambda c: c.replace('b_', 'c_'), self.columns)
   self.missing(categorical_fill='missing', numerical_fill='none')
   self.toidxs(True)
-  for idx, c in enumerate(self.columns): self[c] = self[c].s_compress()
+  for idx, c in enumerate(self.columns): self[c] = self[c].s_compress(aggresiveness, sparsify)
   new_bytes = self.nbytes()
   diff_bytes = original_bytes - new_bytes
   stop('original: %s new: %s improvement: %s percentage: %.2f%%' % 
@@ -621,23 +680,110 @@ def _df_compress(self, aggresiveness=0, to_sparse=False):
         _format_bytes(diff_bytes), diff_bytes * 100.0 / original_bytes))
   return self
 
-def _df_to_vw(self, out_file, y=None, convert_zero_ys=True):  
-  with open(out_file,"wb") as outfile:    
-    for idx, row in self.iterrows():
-      label = 1. if y is None or idx >= len(y) else float(y[idx])
-      if convert_zero_ys and label == 0: label = -1.
-      new_line = [str(label) + ' |n ']
-    
-      for c in self.categoricals() + self.indexes():
-        new_line.append('c' + c + '_' + str(row[c]))
-      
-      for n in self.numericals():
-        val = row[n]
-        if val == 0: continue
-        new_line.append('i' + c + '_' + str(row[n]))
+def _s_hashcode(self):
+  hashcode = hash(self.name)
+  hashcode = hashcode * 17 + self.index.values.sum()
+  hashcode = hashcode * 31 + hash(''.join(map(str, self[0:min(3, self.shape[0])].values)))
+  return hashcode
 
-      outfile.write(" ".join( new_line ) + '\n')
-  return self;
+def _df_hashcode(self):
+  hashcode = self.index.values.sum()
+  hashcode = hashcode * 17 + hash(''.join(self.columns.values))
+  hashcode = hashcode * 31 + hash(''.join(map(str, self[0:min(3, self.shape[0])].values)))
+  return hashcode
+
+def __df_to_lines(df, 
+    out_file_or_y=None, 
+    y=None, 
+    weights=None, 
+    convert_zero_ys=True,
+    output_categorical_value=True,
+    tag_feature_sets=True):    
+  columns_indexes = {}
+  max_col = {'index':0}
+  out_file = out_file_or_y if type(out_file_or_y) is str else None
+  
+  if y is None and out_file_or_y is not None and out_file is None: 
+    y = out_file_or_y
+
+  def get_col_index(name):
+    if name not in columns_indexes:
+      columns_indexes[name] = max_col['index']
+      max_col['index'] += 1
+    return str(columns_indexes[name])
+
+  def impl(outfile):
+    def add_cols(new_line, columns, is_numerical):
+      if len(columns) == 0: return
+      if tag_feature_sets: new_line.append('|' + ('n' if is_numerical else 'c'))
+      for c in columns:        
+        val = row[c] 
+        if val == 0: continue        
+        if not is_numerical:
+          name = c + '_' + str(val)
+          if output_categorical_value: line = get_col_index(name) + ':1'
+          else: line = get_col_index(name)
+        else:           
+          line = get_col_index(c) + ':' + str(val)
+        new_line.append(line)
+      
+    lines = []  
+    for idx, row in _chunked_iterator(df):
+      label = '1.0' if y is None or idx >= len(y) else str(float(y[idx]))
+      if convert_zero_ys and label == '0.0': label = '-1.0'
+      if weights is not None and idx < len(weights):      
+        w = weights[idx]
+        if w != 1: label += ' ' + `w`
+        label += ' \'' + `idx`
+      
+      new_line = [label]      
+      
+      add_cols(new_line, df.numericals(), True)
+      add_cols(new_line, df.categoricals() + df.indexes() + df.binaries(), False)
+
+      line = ' '.join(new_line)
+  
+      if outfile: outfile.write(line + '\n')
+      else: lines.append(line)
+    return lines
+  
+  if out_file:
+    with get_write_file_stream(out_file) as outfile:    
+      return impl(outfile)
+  else: 
+    return impl(None)
+
+def _df_to_vw(self, out_file_or_y=None, y=None, weights=None):    
+  return __df_to_lines(self, out_file_or_y, y, weights, 
+      convert_zero_ys=True,
+      output_categorical_value=False,
+      tag_feature_sets=True)  
+
+def _df_to_svmlight(self, out_file_or_y=None, y=None):
+  return __df_to_lines(self, out_file_or_y, y, None,
+      convert_zero_ys=True,
+      output_categorical_value=True,
+      tag_feature_sets=False)
+
+def _df_to_libfm(self, out_file_or_y=None, y=None):
+  return __df_to_lines(self, out_file_or_y, y, None,
+      convert_zero_ys=False,
+      output_categorical_value=True,
+      tag_feature_sets=False)
+
+
+def _df_summarise(self, opt_y=None, filename='dataset_description', columns=None):
+  from describe import describe
+  describe.Describe(self, opt_y).show()  
+
+def _chunked_iterator(df, chunk_size=1000000):
+  start = 0
+  while True:
+    subset = df[start:start+chunk_size]
+    start += chunk_size
+    for r in subset.iterrows():
+      yield r    
+    if len(subset) < chunk_size: break
 
 # Extensions
 def extend_df(name, function):
@@ -665,14 +811,22 @@ extend_df('categorical_outliers', _df_categorical_outliers)
 extend_df('append_right', _df_append_right)
 extend_df('append_bottom', _df_append_bottom)
 extend_df('shuffle', _df_shuffle)
+extend_df('subsample', _df_subsample)
 extend_df('split', _df_split)
 extend_df('cv', _df_cv)
 extend_df('cv_ohe', _df_cv_ohe)
 extend_df('pca', _df_pca)
 extend_df('noise_filter', _df_noise_filter)
 extend_df('predict', _df_predict)
+extend_df('predict_proba', _df_predict_proba)
+extend_df('self_predict', _df_self_predict)
+extend_df('self_predict_proba', _df_self_predict_proba)
 extend_df('save_csv', _df_save_csv)
 extend_df('to_vw', _df_to_vw)
+extend_df('to_libfm', _df_to_libfm)
+extend_df('to_svmlight', _df_to_svmlight)
+extend_df('to_xgboost', _df_to_svmlight)
+extend_df('hashcode', _df_hashcode)
 
 extend_df('categoricals', _df_categoricals)
 extend_df('indexes', _df_indexes)
@@ -682,6 +836,7 @@ extend_df('binaries', _df_binaries)
 extend_df('trim_on_y', _df_trim_on_y)
 extend_df('nbytes', _df_nbytes)
 extend_df('compress', _df_compress)
+extend_df('summarise', _df_summarise)
 
 # Series Extensions  
 extend_s('one_hot_encode', _s_one_hot_encode)
@@ -689,10 +844,13 @@ extend_s('bin', _s_bin)
 extend_s('categorical_outliers', _s_categorical_outliers)
 extend_s('sigma_limits', _s_sigma_limits)
 extend_s('s_compress', _s_compress)
+extend_s('hashcode', _s_hashcode)
+extend_s('to_indexes', _s_to_indexes)
 
 # Aliases
 extend_s('catout', _s_categorical_outliers)
 extend_s('ohe', _s_one_hot_encode)
+extend_s('toidxs', _s_to_indexes)
 
 extend_df('ohe', _df_one_hot_encode)
 extend_df('toidxs', _df_to_indexes)
