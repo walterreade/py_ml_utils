@@ -1,3 +1,4 @@
+from __future__ import print_function
 import sys
 sys.path.append('utils/lib')
 import numpy as np
@@ -6,16 +7,18 @@ import scipy as scipy
 import cPickle as pickle
 from collections import Counter
 import gzip, time, math, datetime, random, os, gc, logging
-from sklearn import preprocessing, grid_search, utils, metrics, cross_validation
+from sklearn import preprocessing, grid_search, utils, metrics, cross_validation, isotonic, linear_model
 from scipy.stats import sem 
 from scipy.stats.mstats import mode
 from sklearn.externals import joblib
+from xgb import XGBClassifier, XGBRegressor
 
 cfg = {
   'sys_seed':0,
   'debug':True,
   'scoring': None,
-  'indent': 0
+  'indent': 0,
+  'cv_n_jobs': -1
 }
 
 random.seed(cfg['sys_seed'])
@@ -43,8 +46,13 @@ def stop(msg):
     datetime.timedelta(seconds=time.time() - t0)))
   t0 = time.time()
 
+def seed(seed):
+  cfg['sys_seed'] = seed
+  random.seed(cfg['sys_seed'])
+  np.random.seed(cfg['sys_seed']) 
+  
 def reseed(clf):
-  clf.random_state = cfg['sys_seed']
+  if clf is not None: clf.random_state = cfg['sys_seed']
   random.seed(cfg['sys_seed'])
   np.random.seed(cfg['sys_seed']) 
   return clf
@@ -113,27 +121,40 @@ def do_n_sample_search(clf, X, y, n_samples_arr):
   return (scores, sems)
 
 
-def do_cv(clf, X, y, n_samples=None, n_iter=3, test_size=0.1, quiet=False, scoring=None, stratified=False, fit_params=None, reseed_classifier=True, n_jobs=-1):
+def do_cv(clf, X, y, n_samples=None, n_iter=3, test_size=None, quiet=False, 
+      scoring=None, stratified=False, n_jobs=-1, fit_params=None):
   t0 = time.time()
-  if reseed_classifier: reseed(clf)
+  reseed(clf)
   
-  if n_samples is None: n_samples = len(y)
+  if n_samples is None: n_samples = len(X)
   elif type(n_samples) is float: n_samples = int(n_samples)
+  if scoring is None: scoring = cfg['scoring']
+  if test_size is None: test_size = 1./n_iter
   
   try:
     if (n_samples > X.shape[0]): n_samples = X.shape[0]
   except: pass
   cv = cross_validation.ShuffleSplit(n_samples, n_iter=n_iter, test_size=test_size, random_state=cfg['sys_seed']) \
     if not(stratified) else cross_validation.StratifiedShuffleSplit(y, n_iter, train_size=n_samples, test_size=test_size, random_state=cfg['sys_seed'])
-
   if n_jobs == -1 and cfg['cv_n_jobs'] > 0: n_jobs = cfg['cv_n_jobs']
 
   test_scores = cross_validation.cross_val_score(
-      clf, X, y, cv=cv, scoring=scoring or cfg['scoring'], 
-      fit_params=fit_params, n_jobs=n_jobs)
-  if not(quiet): 
-    dbg('%s took: %.2fm' % (mean_score(test_scores), (time.time() - t0)/60))
+      clf, X, y, cv=cv, scoring=scoring, n_jobs=n_jobs, 
+      fit_params=fit_params)
+  if not(quiet): dbg('%s took: %.2fm' % (mean_score(test_scores), (time.time() - t0)/60))
   return (np.mean(test_scores), sem(test_scores))
+
+def test_classifier_vals(prop, vals, clf, X, y):
+  results = []
+  for v in vals:      
+    target_clf = clf.base_classifier if hasattr(clf, 'base_classifier') else clf
+    setattr(target_clf, prop, v)    
+    score = do_cv(clf, X, y)
+    results.append({'prop': prop, 'v':v, 'score': score})  
+  sorted_results = sorted(results, key=lambda r: r['score'][0], reverse=True)
+  best = {'prop': prop, 'value': sorted_results[0]['v'], 'score': sorted_results[0]['score']}
+  dbg('\n\n\n\n', best)
+  return sorted_results
 
 def split(X, y, test_split=0.1):
   X, y = utils.shuffle(X, y, random_state=cfg['sys_seed'])  
@@ -144,12 +165,12 @@ def split(X, y, test_split=0.1):
 
 def proba_scores(y_true, y_preds, scoring=metrics.roc_auc_score):
   for i, y_pred in enumerate(y_preds):
-    print 'classifier [%d]: %.4f' % (i+1, scoring(y_true, y_pred))
+    dbg('classifier [%d]: %.4f' % (i+1, scoring(y_true, y_pred)))
 
-  print 'mean: %.4f' % (scoring(y_true, np.mean(y_preds, axis=0)))
-  print 'max: %.4f' % (scoring(y_true, np.max(y_preds, axis=0)))
-  print 'min: %.4f' % (scoring(y_true, np.min(y_preds, axis=0)))
-  print 'median: %.4f' % (scoring(y_true, np.median(y_preds, axis=0)))
+  dbg('mean: %.4f' % (scoring(y_true, np.mean(y_preds, axis=0))))
+  dbg('max: %.4f' % (scoring(y_true, np.max(y_preds, axis=0))))
+  dbg('min: %.4f' % (scoring(y_true, np.min(y_preds, axis=0))))
+  dbg('median: %.4f' % (scoring(y_true, np.median(y_preds, axis=0))))
 
 def score(clf, X, y, test_split=0.1, auc=False):
   X, y, test_X, test_y = split(X, y, test_split)
@@ -209,7 +230,9 @@ def dump(file, data):
 def load(file, opt_fallback=None):
   full_file = 'data/pickles/' + file
   if not '.' in full_file: full_file += '.pickle'
-  if os.path.isfile(full_file): return joblib.load(full_file);
+  if os.path.isfile(full_file): 
+    if full_file.endswith('.npy'): return np.load(full_file)
+    else: return joblib.load(full_file);
   if opt_fallback is None: return None
   data = opt_fallback()
   dump(file, data)
@@ -246,11 +269,25 @@ def read_data(file):
     return data
 
 def read_df(file, nrows=None):
-  if file.endswith('.pickle'): return load(file)
-  
-  compression = 'gzip' if file.endswith('.gz') else None
-  nrows = None if nrows == None else int(nrows)
-  return pd.read_csv(file, compression=compression, nrows=nrows);
+  t0 = time.time()
+  if file.endswith('.pickle'): 
+    df = load(file)
+  else:
+
+    sep = '\t' if '.tsv' in file else None
+    if file.endswith('.7z'):
+      import libarchive
+   
+      with libarchive.reader(file) as reader:
+        df = pd.read_csv(reader, nrows=nrows, sep=sep);
+    else:
+      
+      compression = 'gzip' if file.endswith('.gz') else None
+      nrows = None if nrows == None else int(nrows)  
+      df = pd.read_csv(file, compression=compression, nrows=nrows, sep=sep);
+  dbg('data frame [' + file + '] read in ' + 
+      str(datetime.timedelta(seconds=time.time() - t0)) + ' shape: ' + str(df.shape))
+  return df
 
 def read_lines(file, ignore_header=False):
   with open(file) as f:
@@ -288,5 +325,47 @@ def to_index(df_or_series, columns=[], drop_originals=False, inplace=False):
       gc.collect()
   return df_or_series
 
-def dbg(*args):
-  if cfg['debug']: print args
+def optimise(predictions, y, scorer):
+  def scorer_func(weights):
+    means = np.average(predictions, axis=0, weights=weights)
+    return -scorer(y, means)  
+
+  starting_values = [0.5]*len(predictions)
+  cons = ({'type':'eq','fun':lambda w: 1-sum(w)})
+  bounds = [(0,1)]*len(predictions)
+  res = scipy.optimize.minimize(scorer_func, starting_values, 
+      method='Nelder-Mead', bounds=bounds, constraints=cons)
+  dbg('Ensamble Score: {best_score}'.format(best_score=res['fun']))
+  dbg('Best Weights: {weights}'.format(weights=res['x']))
+
+def calibrate(y_train, y_true, y_test=None, method='platt'):      
+  if method == 'platt':
+    from sklearn import linear_model
+    clf = linear_model.LogisticRegression()
+    if y_test is None:
+      return pd.DataFrame({'train': y_train, 'const': np.ones(len(y_train))}).self_predict_proba(clf, y_true)
+    else:
+      return pd.DataFrame(y_train).predict_proba(clf, y_true, y_test)      
+  elif method == 'isotonic':    
+    clf = isotonic.IsotonicRegression(out_of_bounds='clip')    
+    if len(y_train.shape) == 2 and y_train.shape[1] > 1:            
+      all_preds = []
+      for target in range(y_train.shape[1]):
+        y_train_target = pd.DataFrame(y_train[:,target])        
+        y_true_target = (y_true == target).astype(int)
+        if y_test is None:
+          preds = y_train_target.self_transform(clf, y_true_target)
+        else:
+          y_test_target = y_test[:,target]
+          preds = y_train_target.transform(clf, y_true_target, y_test_target)
+        all_preds.append(preds)
+      return np.asarray(all_preds).T
+    else:      
+      if y_test is None:
+        res = pd.DataFrame(y_train).self_transform(clf, y_true).T[0]
+      else:
+        res = pd.DataFrame(y_train).transform(clf, y_true, y_test)
+      return np.nan_to_num(res)
+
+def dbg(*args): 
+  if cfg['debug']: print(*args)

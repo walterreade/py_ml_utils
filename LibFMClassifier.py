@@ -4,12 +4,11 @@ import numpy as np
 import pandas as pd
 import math
 from pandas_extensions import * 
+from ExeEstimator import *
 
-_libfm_default_path = 'utils/lib/libfm'
-
-class _LibFM(sklearn.base.BaseEstimator):
+class _LibFM(ExeEstimator):
   def __init__(self,
-         executable=_libfm_default_path,
+         executable='utils/lib/libfm',
          dim='1,1,8',
          init_stdev=0.1,
          iter=100,
@@ -18,10 +17,10 @@ class _LibFM(sklearn.base.BaseEstimator):
          regular=None,         
          task='c', 
          columns=None):
+    ExeEstimator.__init__(self)
     assert method in ['sgd', 'sgda', 'als', 'mcmc']
     assert task in ['r', 'c']
 
-    self.tmpdir = 'tmpfiles'
     self.executable = executable
     self.dim = dim
     self.init_stdev = init_stdev
@@ -35,38 +34,27 @@ class _LibFM(sklearn.base.BaseEstimator):
 
 
   def fit(self, X, y=None):    
-    if type(X) is np.ndarray: 
-      if self.columns is None: raise Exception('LibFM requires columns be set')      
-      X = pd.DataFrame(X, columns=self.columns)
-    if type(X) is pd.DataFrame: X = X.to_libfm(y)    
-
-    self.training_instances = X
+    if type(X) is str: self.train_file = X
+    else: 
+      if not hasattr(X, 'values'): X = pd.DataFrame(X, columns=self.columns)
+      self.train_file = self.save_reusable('_libfm_train', 'to_libfm', X, y)
     return self
 
   def predict(self, X):    
-    if type(X) is np.ndarray: 
-      if self.columns is None: raise Exception('LibFM requires columns be set')      
-      X = pd.DataFrame(X, columns=self.columns)
-    if type(X) is pd.DataFrame: X = X.to_libfm()    
-    return self.predict_proba(X)
+    if type(X) is str: test_file = X
+    else: 
+      if not hasattr(X, 'values'): X = pd.DataFrame(X, columns=self.columns)
+      test_file = self.save_reusable('_libfm_test', 'to_libfm', X)
+
+    self.start_predicting(self.train_file, test_file)
+    self.close_process(self.libfm_process)
+    
+    raw_preds = self.read_predictions(self.prediction_file)
+    return np.asarray(list(raw_preds))    
 
   def predict_proba(self, X):   
-    if type(X) is np.ndarray: 
-      if self.columns is None: raise Exception('LibFM requires columns be set')      
-      X = pd.DataFrame(X, columns=self.columns)
-    if type(X) is pd.DataFrame: X = X.to_libfm() 
-
-    train_file = self.save_tmp_file(self.training_instances, True)
-    test_file = self.save_tmp_file(X, False)
-    self.start_predicting(train_file, test_file)
-    self.close_process()
-    os.remove(train_file)
-    os.remove(test_file)
-    
-    predictions = np.asarray(list(self.read_predictions()))    
+    predictions = self.predict(X)
     return np.vstack([1 - predictions, predictions]).T
-
-
 
   def get_command(self, train_file, test_file, predictions_file):
     assert train_file and os.path.isfile(train_file)
@@ -86,50 +74,11 @@ class _LibFM(sklearn.base.BaseEstimator):
     return ' '.join(args)
 
 
-  def save_tmp_file(self, instances, training=True):    
-    f = self.tmpfile('_tmp_' + ('training' if training else 'testing') + '_file.libfm')
-    with open(f, 'wb') as fs: fs.write('\n'.join(instances))    
-    return f
-
-  def tmpfile(self, suffix):
-    _, f = tempfile.mkstemp(dir=self.tmpdir, suffix=suffix)
-    os.close(_)
-    return self.tmpdir + '/' + f.split('\\')[-1]
-
-  def close_process(self):
-    assert self.libfm_process
-
-    if self.libfm_process.wait() != 0:
-      raise Exception("libfm_process %d (%s) exited abnormally with return code %d" % \
-        (self.libfm_process.pid, self.libfm_process.command, self.libfm_process.returncode))
-
   def start_predicting(self, training_file, testing_file):
     self.prediction_file = self.tmpfile('libfm.prediction')    
 
     command = self.get_command(training_file, testing_file, self.prediction_file)
     self.libfm_process = self.make_subprocess(command)      
-
-  def read_predictions(self):
-    lines = []
-    with open(self.prediction_file) as f:
-        lines=map(float, map(lambda l: l.split('#')[0], 
-            f.readlines()))
-    os.remove(self.prediction_file)
-    return lines
-
-  def make_subprocess(self, command):    
-    stdout = open('nul', 'w')
-    stderr = sys.stderr
-
-    print 'running command: "%s"' % str(command)
-    commands = shlex.split(str(command))
-    result = subprocess.Popen(commands, 
-        stdout=stdout, stderr=stderr, 
-        close_fds=sys.platform != "win32", 
-        universal_newlines=True, cwd='.')
-    result.command = command
-    return result
-
 
 
 class LibFMRegressor(sklearn.base.RegressorMixin, _LibFM):
